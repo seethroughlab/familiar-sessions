@@ -59,7 +59,19 @@ uv run pytest -v
 
 ## TURN
 
-Without TURN, ~30% of guests behind symmetric NAT (corporate, mobile carriers) won't connect. With Cloudflare Calls TURN (free tier), they will:
+Without TURN, ~30% of guests behind symmetric NAT (corporate, mobile carriers) won't connect. Two ways to wire it up — pick one (or both, they're additive):
+
+**Cloudflare Realtime TURN** (recommended; free tier covers 1 TB/month). Create a TURN key in the Cloudflare dashboard, then:
+
+```bash
+fly secrets set CLOUDFLARE_TURN_TOKEN_ID=... \
+                CLOUDFLARE_TURN_API_TOKEN=... \
+                -a familiar-sessions
+```
+
+The relay mints short-lived ICE credentials via Cloudflare's REST API and caches them per-process for ~21.6 h before refresh. Failed refreshes fall back to the last good cache so a Cloudflare outage doesn't take the relay down.
+
+**Self-hosted coturn / static TURN** — for setups where you'd rather run your own:
 
 ```bash
 fly secrets set TURN_SERVER_URL=turn:turn.example.com:3478 \

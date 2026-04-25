@@ -8,6 +8,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, status
 
+from app.cloudflare_turn import get_cloudflare_ice_servers
 from app.config import settings
 from app.sessions import (
     SessionFull,
@@ -21,8 +22,9 @@ HEARTBEAT_TIMEOUT_SECONDS = 5.0
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
 
-def get_ice_servers() -> list[dict[str, Any]]:
-    """STUN + optional TURN. Only handed back to authenticated joiners after success."""
+async def get_ice_servers() -> list[dict[str, Any]]:
+    """STUN + TURN. Cloudflare creds are minted/cached per-process. Static
+    TURN_SERVER_* env vars are appended for compatibility with self-hosted coturn."""
     servers: list[dict[str, Any]] = [
         {"urls": "stun:stun.l.google.com:19302"},
         {"urls": "stun:stun1.l.google.com:19302"},
@@ -34,6 +36,7 @@ def get_ice_servers() -> list[dict[str, Any]]:
         if settings.turn_server_credential:
             turn_config["credential"] = settings.turn_server_credential
         servers.append(turn_config)
+    servers.extend(await get_cloudflare_ice_servers())
     return servers
 
 
@@ -126,7 +129,7 @@ async def session_websocket(websocket: WebSocket) -> None:
                         "type": "session_created",
                         "session": session.to_dict(),
                         "your_user_id": str(current_user_id),
-                        "ice_servers": get_ice_servers(),
+                        "ice_servers": await get_ice_servers(),
                     }
                 )
 
@@ -164,7 +167,7 @@ async def session_websocket(websocket: WebSocket) -> None:
                         "session": session.to_dict(),
                         "your_user_id": str(current_user_id),
                         "your_peer_id": participant.peer_id,
-                        "ice_servers": get_ice_servers(),
+                        "ice_servers": await get_ice_servers(),
                     }
                 )
 

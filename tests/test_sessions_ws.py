@@ -45,12 +45,14 @@ def test_create_join_playback_leave(client: TestClient) -> None:
         assert len(code) >= 8
         assert "your_user_id" in created
         assert created["session"]["has_password"] is False
+        assert isinstance(created["ice_servers"], list) and created["ice_servers"]
 
         with client.websocket_connect("/api/v1/sessions/ws") as guest_ws:
             _send(guest_ws, {"type": "join_guest", "code": code, "guest_name": "Bob"})
             joined = guest_ws.receive_json()
             assert joined["type"] == "session_joined"
             assert joined["session"]["participant_count"] == 2
+            assert isinstance(joined["ice_servers"], list) and joined["ice_servers"]
 
             # Drain host's notifications (guest_joined + user_joined)
             saw = {host_ws.receive_json()["type"], host_ws.receive_json()["type"]}
