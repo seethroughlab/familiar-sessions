@@ -96,6 +96,28 @@ export function GuestListener() {
     }
   }, []);
 
+  // Prime the audio element with the user gesture from "Join Session". iOS Safari
+  // requires HTMLAudioElement.play() to be called from a user-initiated event
+  // before any stream-fed playback is allowed. We attach a silent AudioContext-backed
+  // source first so the play() call has something to work with, then later just swap
+  // in the WebRTC stream's srcObject — playback continues without needing a new gesture.
+  const primeAudio = useCallback((): boolean => {
+    if (!audioRef.current) return false;
+    const el = audioRef.current;
+    el.muted = false;
+    el.volume = isMuted ? 0 : volume;
+    try {
+      // Push the element into "playing" state via a no-op play() call.
+      // On iOS Safari this captures the user gesture for future srcObject swaps.
+      void el.play().catch(() => {
+        /* play() will likely fail with no source; that's fine — gesture is captured */
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }, [volume, isMuted]);
+
   const tryPlayAudio = useCallback(() => {
     if (!audioRef.current) return;
     audioRef.current
@@ -121,6 +143,8 @@ export function GuestListener() {
       pc.ontrack = (event) => {
         setIsReceivingAudio(true);
         if (!audioRef.current) {
+          // Fallback path — element should already exist via the JSX <audio> ref,
+          // but if React hasn't mounted it yet we create one as a safety net.
           audioRef.current = new Audio();
           audioRef.current.autoplay = true;
         }
@@ -228,6 +252,9 @@ export function GuestListener() {
     setIsConnecting(true);
     setError(null);
 
+    // Capture the user gesture from this click for iOS Safari autoplay.
+    primeAudio();
+
     const ws = new WebSocket(buildWsUrl());
 
     ws.onopen = () => {
@@ -262,7 +289,7 @@ export function GuestListener() {
     };
 
     wsRef.current = ws;
-  }, [code, guestName, password, handleMessage, session]);
+  }, [code, guestName, password, handleMessage, session, primeAudio]);
 
   const leave = useCallback(() => {
     send({ type: 'leave' });
@@ -449,6 +476,11 @@ export function GuestListener() {
         Listening as <span className="text-white">{guestName}</span> · Code:{' '}
         <span className="font-mono">{session.code}</span>
       </footer>
+
+      {/* Hidden audio sink. Rendering it in JSX (rather than `new Audio()`) makes iOS
+          Safari treat the element as user-controlled, so the gesture captured by
+          primeAudio() applies when WebRTC later assigns srcObject. */}
+      <audio ref={audioRef} autoPlay playsInline className="hidden" />
     </div>
   );
 }
