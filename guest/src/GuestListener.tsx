@@ -3,11 +3,12 @@
  * Same-origin WebSocket signaling + WebRTC audio playback.
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, type FormEvent } from 'react';
 import { useParams } from 'react-router-dom';
-import { Radio, Volume2, VolumeX, Users, Music2, Loader2, Play } from 'lucide-react';
+import { Radio, Volume2, VolumeX, Users, Music2, Loader2, Play, Send } from 'lucide-react';
 
 const MAX_RECONNECT_ATTEMPTS = 10;
+const CHAT_MESSAGE_MAX_LENGTH = 500;
 
 interface SessionInfo {
   id: string;
@@ -36,6 +37,13 @@ interface TrackMeta {
   album?: string;
 }
 
+interface ChatMessage {
+  user_id: string;
+  username: string;
+  message: string;
+  timestamp: number;
+}
+
 function buildWsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${window.location.host}/api/v1/sessions/ws`;
@@ -58,12 +66,15 @@ export function GuestListener() {
   const [isReceivingAudio, setIsReceivingAudio] = useState(false);
   const [trackMeta, setTrackMeta] = useState<TrackMeta | null>(null);
   const [iceServers, setIceServers] = useState<IceServer[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
 
   const wsRef = useRef<WebSocket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const reconnectAttemptsRef = useRef<number>(0);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Pre-flight the code so we know the session name + whether a password is required.
   useEffect(() => {
@@ -202,6 +213,8 @@ export function GuestListener() {
     wsRef.current?.close();
     wsRef.current = null;
     setIsReceivingAudio(false);
+    setChatMessages([]);
+    setChatInput('');
     reconnectAttemptsRef.current = 0;
   }, []);
 
@@ -225,6 +238,17 @@ export function GuestListener() {
           break;
         case 'playback_update':
           if (data.track_meta) setTrackMeta(data.track_meta);
+          break;
+        case 'chat':
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              user_id: data.user_id,
+              username: data.username,
+              message: data.message,
+              timestamp: Date.now(),
+            },
+          ]);
           break;
         case 'user_kicked':
           setError('You were removed from the session');
@@ -298,9 +322,32 @@ export function GuestListener() {
     setTrackMeta(null);
   }, [send, cleanup]);
 
+  const sendChatMessage = useCallback(
+    (message: string) => {
+      const trimmed = message.trim().slice(0, CHAT_MESSAGE_MAX_LENGTH);
+      if (!trimmed) return;
+      send({ type: 'chat', message: trimmed });
+    },
+    [send],
+  );
+
+  const handleSubmitChat = useCallback(
+    (e: FormEvent) => {
+      e.preventDefault();
+      sendChatMessage(chatInput);
+      setChatInput('');
+    },
+    [chatInput, sendChatMessage],
+  );
+
   useEffect(() => {
     if (audioRef.current) audioRef.current.volume = isMuted ? 0 : volume;
   }, [volume, isMuted]);
+
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [chatMessages.length]);
 
   useEffect(() => () => cleanup(), [cleanup]);
 
@@ -471,6 +518,41 @@ export function GuestListener() {
           </div>
         </div>
       </main>
+
+      <section className="border-t border-zinc-800 bg-zinc-900/50">
+        <div className="max-w-2xl mx-auto flex flex-col">
+          <div ref={chatScrollRef} className="max-h-48 overflow-y-auto px-4 py-3 space-y-2">
+            {chatMessages.length === 0 ? (
+              <div className="text-sm text-zinc-500 text-center py-4">No messages yet</div>
+            ) : (
+              chatMessages.map((msg, i) => (
+                <div key={i} className="text-sm">
+                  <span className="font-medium text-zinc-300">{msg.username}: </span>
+                  <span className="text-zinc-400">{msg.message}</span>
+                </div>
+              ))
+            )}
+          </div>
+          <form onSubmit={handleSubmitChat} className="flex gap-2 p-3 border-t border-zinc-800">
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder="Send a message..."
+              maxLength={CHAT_MESSAGE_MAX_LENGTH}
+              className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-sm placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-green-500"
+            />
+            <button
+              type="submit"
+              disabled={!chatInput.trim()}
+              className="p-2 bg-green-600 hover:bg-green-500 disabled:bg-zinc-700 disabled:text-zinc-500 rounded-md transition-colors"
+              aria-label="Send chat message"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          </form>
+        </div>
+      </section>
 
       <footer className="p-4 text-center text-sm text-zinc-500">
         Listening as <span className="text-white">{guestName}</span> · Code:{' '}
