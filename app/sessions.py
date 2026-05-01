@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import secrets
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -13,13 +13,16 @@ import bcrypt
 from fastapi import WebSocket
 
 MAX_CONCURRENT_SESSIONS = 50
+DEFAULT_FAMILIAR_COLOR = "#7dd3fc"
+ALLOWED_FAMILIAR_VARIANTS = {"halo", "ember", "prism"}
+ALLOWED_FAMILIAR_ACCENTS = {"drift", "orbit", "ripple"}
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
-class SessionRole(str, Enum):
+class SessionRole(StrEnum):
     HOST = "host"
     LISTENER = "listener"
     GUEST = "guest"
@@ -29,12 +32,57 @@ class SessionFull(Exception):
     """Raised when SessionManager has hit MAX_CONCURRENT_SESSIONS."""
 
 
+@dataclass(frozen=True)
+class Familiar:
+    variant: str
+    color: str
+    accent: str
+    seed: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "variant": self.variant,
+            "color": self.color,
+            "accent": self.accent,
+            "seed": self.seed,
+        }
+
+
+def _normalize_color(value: Any) -> str:
+    if not isinstance(value, str):
+        return DEFAULT_FAMILIAR_COLOR
+    text = value.strip()
+    if len(text) == 7 and text.startswith("#") and all(c in "0123456789abcdefABCDEF" for c in text[1:]):
+        return text.lower()
+    return DEFAULT_FAMILIAR_COLOR
+
+
+def sanitize_familiar(payload: Any, fallback_seed_source: str) -> Familiar:
+    data = payload if isinstance(payload, dict) else {}
+    variant = data.get("variant")
+    if variant not in ALLOWED_FAMILIAR_VARIANTS:
+        variant = "halo"
+    accent = data.get("accent")
+    if accent not in ALLOWED_FAMILIAR_ACCENTS:
+        accent = "drift"
+    seed_raw = data.get("seed")
+    if not isinstance(seed_raw, int):
+        seed_raw = sum(ord(ch) for ch in fallback_seed_source) % 10_000
+    return Familiar(
+        variant=variant,
+        color=_normalize_color(data.get("color")),
+        accent=accent,
+        seed=max(0, seed_raw),
+    )
+
+
 @dataclass
 class Participant:
     user_id: UUID
     username: str
     websocket: WebSocket
     role: SessionRole
+    familiar: Familiar
     joined_at: datetime = field(default_factory=utcnow)
     webrtc_connected: bool = False
     peer_id: str | None = None
@@ -83,6 +131,7 @@ class ListeningSession:
                     "user_id": str(p.user_id),
                     "username": p.username,
                     "role": p.role.value,
+                    "familiar": p.familiar.to_dict(),
                     "joined_at": p.joined_at.isoformat(),
                     "webrtc_connected": p.webrtc_connected,
                 }
@@ -122,6 +171,7 @@ class SessionManager:
         name: str,
         websocket: WebSocket,
         password: str | None = None,
+        familiar_payload: Any = None,
     ) -> ListeningSession:
         if len(self._sessions) >= MAX_CONCURRENT_SESSIONS:
             raise SessionFull(f"Server is at the {MAX_CONCURRENT_SESSIONS}-session limit")
@@ -142,6 +192,7 @@ class SessionManager:
             username=host_username,
             websocket=websocket,
             role=SessionRole.HOST,
+            familiar=sanitize_familiar(familiar_payload, host_username),
         )
         session.participants[host_id] = host
 
@@ -175,6 +226,7 @@ class SessionManager:
         username: str,
         websocket: WebSocket,
         role: SessionRole = SessionRole.LISTENER,
+        familiar_payload: Any = None,
     ) -> Participant:
         user_id = uuid4()
         peer_id = secrets.token_urlsafe(8)
@@ -183,6 +235,7 @@ class SessionManager:
             username=username,
             websocket=websocket,
             role=role,
+            familiar=sanitize_familiar(familiar_payload, username),
             peer_id=peer_id,
         )
         session.participants[user_id] = participant
@@ -217,6 +270,16 @@ class SessionManager:
             participant = session.participants.get(user_id)
             if participant:
                 participant.webrtc_connected = connected
+
+    def update_familiar(self, user_id: UUID, payload: Any) -> Participant | None:
+        session = self.get_user_session(user_id)
+        if session is None:
+            return None
+        participant = session.participants.get(user_id)
+        if participant is None:
+            return None
+        participant.familiar = sanitize_familiar(payload, participant.username)
+        return participant
 
     def remove_user(self, user_id: UUID) -> ListeningSession | None:
         session_id = self._user_sessions.pop(user_id, None)

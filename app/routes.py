@@ -18,6 +18,7 @@ from app.sessions import (
 )
 
 HEARTBEAT_TIMEOUT_SECONDS = 5.0
+ALLOWED_REACTIONS = {"cheer", "pulse", "wave", "spark"}
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
@@ -77,12 +78,14 @@ async def session_websocket(websocket: WebSocket) -> None:
     """Public signaling WebSocket. Anyone can create or join — the code is the auth.
 
     Messages — client → server:
-      create        {name, username, password?}
-      join          {code, username, password?}                       (alias for join_guest)
-      join_guest    {code, guest_name, password?}
+      create        {name, username, password?, familiar?}
+      join          {code, username, password?, familiar?}            (alias for join_guest)
+      join_guest    {code, guest_name, password?, familiar?}
+      update_familiar {familiar}
       playback      {track_id, is_playing, position_ms}               (host only)
       sync_request  {}
       chat          {message}
+      reaction      {kind}
       kick          {target_user_id}                                  (host only)
       leave         {}
       webrtc_request {}
@@ -101,7 +104,7 @@ async def session_websocket(websocket: WebSocket) -> None:
                 data = await asyncio.wait_for(
                     websocket.receive_json(), timeout=HEARTBEAT_TIMEOUT_SECONDS
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 if current_user_id is not None:
                     await _broadcast_heartbeat(manager, current_user_id)
                 continue
@@ -118,6 +121,7 @@ async def session_websocket(websocket: WebSocket) -> None:
                         name=name,
                         websocket=websocket,
                         password=password,
+                        familiar_payload=data.get("familiar"),
                     )
                 except SessionFull as e:
                     await websocket.send_json({"type": "error", "message": str(e)})
@@ -157,7 +161,11 @@ async def session_websocket(websocket: WebSocket) -> None:
 
                 role = SessionRole.GUEST if msg_type == "join_guest" else SessionRole.LISTENER
                 participant = manager.join_session(
-                    session=session, username=username, websocket=websocket, role=role
+                    session=session,
+                    username=username,
+                    websocket=websocket,
+                    role=role,
+                    familiar_payload=data.get("familiar"),
                 )
                 current_user_id = participant.user_id
 
@@ -178,6 +186,7 @@ async def session_websocket(websocket: WebSocket) -> None:
                         "user_id": str(current_user_id),
                         "username": username,
                         "peer_id": participant.peer_id,
+                        "familiar": participant.familiar.to_dict(),
                         "participant_count": len(session.participants),
                     },
                 )
@@ -190,6 +199,7 @@ async def session_websocket(websocket: WebSocket) -> None:
                             "user_id": str(current_user_id),
                             "username": username,
                             "role": role.value,
+                            "familiar": participant.familiar.to_dict(),
                         },
                         "participant_count": len(session.participants),
                     },
@@ -264,6 +274,53 @@ async def session_websocket(websocket: WebSocket) -> None:
                         "user_id": str(current_user_id),
                         "username": participant.username,
                         "message": data.get("message", ""),
+                    },
+                )
+
+            elif msg_type == "update_familiar":
+                if not current_user_id:
+                    continue
+                session = manager.get_user_session(current_user_id)
+                if session is None:
+                    continue
+                participant = manager.update_familiar(current_user_id, data.get("familiar"))
+                if participant is None:
+                    continue
+                await manager.broadcast(
+                    session,
+                    {
+                        "type": "user_updated",
+                        "user": {
+                            "user_id": str(current_user_id),
+                            "username": participant.username,
+                            "role": participant.role.value,
+                            "familiar": participant.familiar.to_dict(),
+                            "joined_at": participant.joined_at.isoformat(),
+                            "webrtc_connected": participant.webrtc_connected,
+                        },
+                    },
+                )
+
+            elif msg_type == "reaction":
+                if not current_user_id:
+                    continue
+                session = manager.get_user_session(current_user_id)
+                if session is None:
+                    continue
+                participant = session.participants.get(current_user_id)
+                if participant is None:
+                    continue
+                kind = data.get("kind")
+                if kind not in ALLOWED_REACTIONS:
+                    continue
+                await manager.broadcast(
+                    session,
+                    {
+                        "type": "user_reaction",
+                        "user_id": str(current_user_id),
+                        "username": participant.username,
+                        "kind": kind,
+                        "timestamp": utcnow().isoformat(),
                     },
                 )
 

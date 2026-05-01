@@ -6,9 +6,23 @@
 import { useState, useEffect, useCallback, useRef, type FormEvent } from 'react';
 import { useParams } from 'react-router-dom';
 import { Radio, Volume2, VolumeX, Users, Music2, Loader2, Play, Send } from 'lucide-react';
+import {
+  FamiliarPicker,
+  FamiliarRoom,
+  ReactionBar,
+  createGeneratedFamiliar,
+  loadStoredGuestFamiliar,
+  saveStoredGuestFamiliar,
+  sanitizeFamiliar,
+  type FamiliarConfig,
+  type SessionParticipant,
+  type SessionReaction,
+  type ReactionKind,
+} from './Familiars';
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 const CHAT_MESSAGE_MAX_LENGTH = 500;
+const REACTION_RETENTION_MS = 4000;
 
 interface SessionInfo {
   id: string;
@@ -16,6 +30,7 @@ interface SessionInfo {
   name: string;
   host_id: string;
   participant_count: number;
+  participants: SessionParticipant[];
   webrtc_enabled: boolean;
   has_password: boolean;
   playback_state: {
@@ -36,26 +51,34 @@ interface TrackMeta {
   artist?: string;
   album?: string;
 }
-
-interface ChatMessage {
-  user_id: string;
-  username: string;
-  message: string;
-  timestamp: number;
-}
+interface ChatMessage { user_id: string; username: string; message: string; timestamp: number; }
 
 function buildWsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${window.location.host}/api/v1/sessions/ws`;
 }
 
+function normalizeSession(session: SessionInfo): SessionInfo {
+  return {
+    ...session,
+    participants: Array.isArray(session.participants)
+      ? session.participants.map((participant) => ({
+          ...participant,
+          familiar: sanitizeFamiliar(participant.familiar, participant.username),
+        }))
+      : [],
+  };
+}
+
 export function GuestListener() {
   const { code: codeParam } = useParams<{ code?: string }>();
   const [code, setCode] = useState((codeParam ?? '').toUpperCase());
   const [guestName, setGuestName] = useState('');
+  const [myUserId, setMyUserId] = useState<string | null>(null);
   const [password, setPassword] = useState('');
   const [needsPassword, setNeedsPassword] = useState(false);
   const [sessionPreview, setSessionPreview] = useState<SessionInfo | null>(null);
+  const [myFamiliar, setMyFamiliar] = useState<FamiliarConfig>(() => loadStoredGuestFamiliar() ?? createGeneratedFamiliar('Guest'));
 
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -68,6 +91,7 @@ export function GuestListener() {
   const [iceServers, setIceServers] = useState<IceServer[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
+  const [reactions, setReactions] = useState<SessionReaction[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -75,6 +99,10 @@ export function GuestListener() {
   const reconnectAttemptsRef = useRef<number>(0);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setMyFamiliar((prev) => sanitizeFamiliar(prev, guestName || 'Guest'));
+  }, [guestName]);
 
   // Pre-flight the code so we know the session name + whether a password is required.
   useEffect(() => {
@@ -105,6 +133,17 @@ export function GuestListener() {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(message));
     }
+  }, []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setReactions((prev) =>
+        prev.filter((reaction) => Date.now() - reaction.timestamp < REACTION_RETENTION_MS),
+      );
+    }, 1000);
+    return () => {
+      clearInterval(interval);
+    };
   }, []);
 
   // Prime the audio element with the user gesture from "Join Session". iOS Safari
@@ -215,6 +254,8 @@ export function GuestListener() {
     setIsReceivingAudio(false);
     setChatMessages([]);
     setChatInput('');
+    setReactions([]);
+    setMyUserId(null);
     reconnectAttemptsRef.current = 0;
   }, []);
 
@@ -223,12 +264,74 @@ export function GuestListener() {
       const data = JSON.parse(event.data);
       switch (data.type) {
         case 'session_joined':
-          setSession(data.session);
+          setSession(normalizeSession(data.session));
+          if (typeof data.your_user_id === 'string') setMyUserId(data.your_user_id);
           if (data.ice_servers) setIceServers(data.ice_servers);
           setError(null);
           setIsConnecting(false);
           reconnectAttemptsRef.current = 0;
           setTimeout(() => send({ type: 'webrtc_request' }), 500);
+          break;
+        case 'user_joined':
+          if (data.user && typeof data.participant_count === 'number') {
+            setSession((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    participant_count: data.participant_count,
+                    participants: [
+                      ...prev.participants,
+                      {
+                        ...data.user,
+                        familiar: sanitizeFamiliar(data.user.familiar, data.user.username ?? 'Guest'),
+                      },
+                    ],
+                  }
+                : prev,
+            );
+          }
+          break;
+        case 'user_updated':
+          if (data.user?.user_id) {
+            setSession((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    participants: prev.participants.map((participant) =>
+                      participant.user_id === data.user.user_id
+                        ? {
+                            ...participant,
+                            ...data.user,
+                            familiar: sanitizeFamiliar(data.user.familiar, data.user.username ?? participant.username),
+                          }
+                        : participant,
+                    ),
+                  }
+                : prev,
+            );
+          }
+          break;
+        case 'user_left':
+          if (data.reason === 'host_left') {
+            setError('The host ended the session');
+            setSession(null);
+            cleanup();
+            break;
+          }
+          if (typeof data.user_id === 'string') {
+            setSession((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    participant_count:
+                      typeof data.participant_count === 'number'
+                        ? data.participant_count
+                        : Math.max(0, prev.participant_count - 1),
+                    participants: prev.participants.filter((participant) => participant.user_id !== data.user_id),
+                  }
+                : prev,
+            );
+          }
           break;
         case 'webrtc_offer':
           if (data.sdp) void handleOffer(data.sdp);
@@ -250,17 +353,23 @@ export function GuestListener() {
             },
           ]);
           break;
+        case 'user_reaction':
+          if (typeof data.user_id === 'string' && typeof data.kind === 'string') {
+            setReactions((prev) => [
+              ...prev,
+              {
+                user_id: data.user_id,
+                username: typeof data.username === 'string' ? data.username : undefined,
+                kind: data.kind as ReactionKind,
+                timestamp: Date.now(),
+              },
+            ].slice(-24));
+          }
+          break;
         case 'user_kicked':
           setError('You were removed from the session');
           setSession(null);
           cleanup();
-          break;
-        case 'user_left':
-          if (data.reason === 'host_left') {
-            setError('The host ended the session');
-            setSession(null);
-            cleanup();
-          }
           break;
         case 'error':
           setError(data.message);
@@ -288,6 +397,7 @@ export function GuestListener() {
           code: code.toUpperCase(),
           guest_name: guestName,
           password: password || undefined,
+          familiar: myFamiliar,
         }),
       );
     };
@@ -313,7 +423,7 @@ export function GuestListener() {
     };
 
     wsRef.current = ws;
-  }, [code, guestName, password, handleMessage, session, primeAudio]);
+  }, [code, guestName, password, handleMessage, myFamiliar, session, primeAudio]);
 
   const leave = useCallback(() => {
     send({ type: 'leave' });
@@ -329,6 +439,39 @@ export function GuestListener() {
       send({ type: 'chat', message: trimmed });
     },
     [send],
+  );
+
+  const sendReaction = useCallback(
+    (kind: ReactionKind) => {
+      send({ type: 'reaction', kind });
+    },
+    [send],
+  );
+
+  const updateMySessionFamiliar = useCallback(
+    (next: FamiliarConfig) => {
+      const normalized = sanitizeFamiliar(next, guestName || 'Guest');
+      setMyFamiliar(normalized);
+      saveStoredGuestFamiliar(normalized);
+      if (myUserId) {
+        setSession((prev) =>
+          prev
+            ? {
+                ...prev,
+                participants: prev.participants.map((participant) =>
+                  participant.user_id === myUserId
+                    ? { ...participant, familiar: normalized }
+                    : participant,
+                ),
+              }
+            : prev,
+        );
+      }
+      if (session) {
+        send({ type: 'update_familiar', familiar: normalized });
+      }
+    },
+    [guestName, myUserId, send, session],
   );
 
   const handleSubmitChat = useCallback(
@@ -378,6 +521,8 @@ export function GuestListener() {
                 className="w-full px-4 py-3 bg-zinc-700 border border-zinc-600 rounded-lg text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-green-500"
               />
             </div>
+
+            <FamiliarPicker value={myFamiliar} onChange={updateMySessionFamiliar} />
 
             <div>
               <label className="block text-sm text-zinc-400 mb-1">Session code</label>
@@ -453,68 +598,83 @@ export function GuestListener() {
         </div>
       </header>
 
-      <main className="flex-1 flex items-center justify-center p-8">
-        <div className="text-center max-w-md">
-          <div className="mb-8">
-            <div className="w-48 h-48 mx-auto mb-6 bg-zinc-800 rounded-xl flex items-center justify-center overflow-hidden">
-              <Music2 className="w-16 h-16 text-zinc-600" />
+      <main className="flex-1 p-8">
+        <div className="max-w-4xl mx-auto space-y-8">
+          <FamiliarRoom participants={session.participants} reactions={reactions} myUserId={myUserId} />
+
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
+            <div className="text-center max-w-md mx-auto">
+              <div className="mb-8">
+                <div className="w-48 h-48 mx-auto mb-6 bg-zinc-800 rounded-xl flex items-center justify-center overflow-hidden">
+                  <Music2 className="w-16 h-16 text-zinc-600" />
+                </div>
+
+                {trackMeta?.title || trackMeta?.artist ? (
+                  <div>
+                    {trackMeta.title && (
+                      <h2 className="text-xl font-semibold">{trackMeta.title}</h2>
+                    )}
+                    {trackMeta.artist && <p className="text-zinc-400">{trackMeta.artist}</p>}
+                    {trackMeta.album && <p className="text-sm text-zinc-500">{trackMeta.album}</p>}
+                  </div>
+                ) : (
+                  <div className="text-zinc-400">
+                    {isReceivingAudio ? 'Now playing...' : 'Waiting for audio...'}
+                  </div>
+                )}
+              </div>
+
+              <div
+                className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm ${
+                  isReceivingAudio ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    isReceivingAudio ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'
+                  }`}
+                />
+                {isReceivingAudio ? 'Connected' : 'Connecting...'}
+              </div>
+
+              {needsAudioGesture && (
+                <button
+                  onClick={tryPlayAudio}
+                  className="mt-6 inline-flex items-center gap-2 px-5 py-3 bg-green-600 hover:bg-green-500 rounded-lg font-medium transition-colors"
+                >
+                  <Play className="w-5 h-5" /> Tap to start audio
+                </button>
+              )}
+
+              <div className="mt-8 flex items-center justify-center gap-4">
+                <button
+                  onClick={() => setIsMuted(!isMuted)}
+                  className="p-2 text-zinc-400 hover:text-white transition-colors"
+                  aria-label={isMuted ? 'Unmute' : 'Mute'}
+                >
+                  {isMuted ? <VolumeX className="w-6 h-6" /> : <Volume2 className="w-6 h-6" />}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={volume}
+                  onChange={(e) => setVolume(parseFloat(e.target.value))}
+                  className="w-32 accent-green-500"
+                  aria-label="Volume"
+                />
+              </div>
             </div>
 
-            {trackMeta?.title || trackMeta?.artist ? (
-              <div>
-                {trackMeta.title && (
-                  <h2 className="text-xl font-semibold">{trackMeta.title}</h2>
-                )}
-                {trackMeta.artist && <p className="text-zinc-400">{trackMeta.artist}</p>}
-                {trackMeta.album && <p className="text-sm text-zinc-500">{trackMeta.album}</p>}
+            <div className="space-y-4">
+              <FamiliarPicker value={myFamiliar} onChange={updateMySessionFamiliar} />
+              <div className="rounded-xl border border-zinc-700 bg-zinc-800/70 p-4">
+                <div className="mb-2 text-sm font-medium text-zinc-100">Quick reactions</div>
+                <div className="mb-3 text-xs text-zinc-500">Brief pulses of expression for everyone in the room</div>
+                <ReactionBar onReact={sendReaction} />
               </div>
-            ) : (
-              <div className="text-zinc-400">
-                {isReceivingAudio ? 'Now playing...' : 'Waiting for audio...'}
-              </div>
-            )}
-          </div>
-
-          <div
-            className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm ${
-              isReceivingAudio ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'
-            }`}
-          >
-            <span
-              className={`w-2 h-2 rounded-full ${
-                isReceivingAudio ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'
-              }`}
-            />
-            {isReceivingAudio ? 'Connected' : 'Connecting...'}
-          </div>
-
-          {needsAudioGesture && (
-            <button
-              onClick={tryPlayAudio}
-              className="mt-6 inline-flex items-center gap-2 px-5 py-3 bg-green-600 hover:bg-green-500 rounded-lg font-medium transition-colors"
-            >
-              <Play className="w-5 h-5" /> Tap to start audio
-            </button>
-          )}
-
-          <div className="mt-8 flex items-center justify-center gap-4">
-            <button
-              onClick={() => setIsMuted(!isMuted)}
-              className="p-2 text-zinc-400 hover:text-white transition-colors"
-              aria-label={isMuted ? 'Unmute' : 'Mute'}
-            >
-              {isMuted ? <VolumeX className="w-6 h-6" /> : <Volume2 className="w-6 h-6" />}
-            </button>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={volume}
-              onChange={(e) => setVolume(parseFloat(e.target.value))}
-              className="w-32 accent-green-500"
-              aria-label="Volume"
-            />
+            </div>
           </div>
         </div>
       </main>
