@@ -14,6 +14,7 @@ import {
   loadStoredGuestFamiliar,
   saveStoredGuestFamiliar,
   sanitizeFamiliar,
+  type BeatAnchor,
   type FamiliarConfig,
   type SessionParticipant,
   type SessionReaction,
@@ -50,6 +51,7 @@ interface TrackMeta {
   title?: string;
   artist?: string;
   album?: string;
+  bpm?: number | null;
 }
 interface ChatMessage { user_id: string; username: string; message: string; timestamp: number; }
 
@@ -92,6 +94,7 @@ export function GuestListener() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [reactions, setReactions] = useState<SessionReaction[]>([]);
+  const [beatAnchor, setBeatAnchor] = useState<BeatAnchor | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -339,9 +342,20 @@ export function GuestListener() {
         case 'webrtc_ice':
           if (data.candidate) void handleIceCandidate(data.candidate);
           break;
-        case 'playback_update':
+        case 'playback_update': {
           if (data.track_meta) setTrackMeta(data.track_meta);
+          const meta = (data.track_meta ?? {}) as TrackMeta;
+          const bpm =
+            typeof meta.bpm === 'number' && Number.isFinite(meta.bpm) ? meta.bpm : null;
+          setBeatAnchor({
+            bpm,
+            positionMs: typeof data.position_ms === 'number' ? data.position_ms : 0,
+            receivedAt: Date.now(),
+            isPlaying: typeof data.is_playing === 'boolean' ? data.is_playing : false,
+            trackId: typeof data.track_id === 'string' ? data.track_id : null,
+          });
           break;
+        }
         case 'chat':
           setChatMessages((prev) => [
             ...prev,
@@ -600,7 +614,7 @@ export function GuestListener() {
 
       <main className="flex-1 p-8">
         <div className="max-w-4xl mx-auto space-y-8">
-          <FamiliarRoom participants={session.participants} reactions={reactions} myUserId={myUserId} />
+          <FamiliarRoom participants={session.participants} reactions={reactions} myUserId={myUserId} beatAnchor={beatAnchor} />
 
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
             <div className="text-center max-w-md mx-auto">

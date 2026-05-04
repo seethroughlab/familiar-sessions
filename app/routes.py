@@ -238,7 +238,9 @@ async def session_websocket(websocket: WebSocket) -> None:
                 }
                 if isinstance(track_meta, dict):
                     payload["track_meta"] = {
-                        k: track_meta.get(k) for k in ("title", "artist", "album") if k in track_meta
+                        k: track_meta.get(k)
+                        for k in ("title", "artist", "album", "bpm")
+                        if k in track_meta
                     }
                 await manager.broadcast(session, payload, exclude_user=current_user_id)
 

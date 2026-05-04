@@ -1,4 +1,5 @@
-import type { CSSProperties } from 'react';
+import { useEffect, useRef, type CSSProperties, type RefObject } from 'react';
+import { Crown } from 'lucide-react';
 
 export type FamiliarVariant = 'halo' | 'ember' | 'prism';
 export type FamiliarAccent = 'drift' | 'orbit' | 'ripple';
@@ -98,6 +99,79 @@ export function saveStoredGuestFamiliar(familiar: FamiliarConfig): void {
   } catch {
     // Ignore localStorage failures.
   }
+}
+
+export interface BeatAnchor {
+  bpm: number | null;
+  positionMs: number;
+  receivedAt: number;
+  isPlaying: boolean;
+  trackId: string | null;
+}
+
+export const FALLBACK_BOB_PERIOD_MS = 2600;
+export const BOB_AMPLITUDE_CROWD_PX = 3;
+export const BOB_AMPLITUDE_HOST_PX = 4;
+export const TRACK_GLOW_DURATION_MS = 1200;
+
+export function computeBeatPhase(anchor: BeatAnchor | null, now: number): number {
+  if (!anchor) return 0;
+  const elapsed = anchor.isPlaying
+    ? Math.max(0, anchor.positionMs + (now - anchor.receivedAt))
+    : Math.max(0, now - anchor.receivedAt);
+  const period =
+    anchor.bpm && anchor.bpm > 0 && Number.isFinite(anchor.bpm)
+      ? 60_000 / anchor.bpm
+      : FALLBACK_BOB_PERIOD_MS;
+  const phase = (elapsed % period) / period;
+  return phase >= 0 ? phase : phase + 1;
+}
+
+export type SessionRole = 'host' | 'listener' | 'guest';
+
+export interface RoomPosition {
+  xPct: number;
+  yPct: number;
+}
+
+export const STAGE_HOST_POSITION: RoomPosition = { xPct: 50, yPct: 22 };
+
+const CROWD_ROW_Y_PCTS: Record<1 | 2 | 3, number[]> = {
+  1: [66],
+  2: [56, 80],
+  3: [50, 68, 84],
+};
+const CROWD_X_INSET = 10;
+
+function pickRowCount(totalCrowd: number): 1 | 2 | 3 {
+  if (totalCrowd <= 4) return 1;
+  if (totalCrowd <= 8) return 2;
+  return 3;
+}
+
+export function computeRoomPosition(
+  participant: { user_id: string; role: SessionRole },
+  indexAmongCrowd: number,
+  totalCrowd: number,
+): RoomPosition {
+  if (participant.role === 'host') {
+    return { ...STAGE_HOST_POSITION };
+  }
+  const safeTotal = Math.max(1, totalCrowd);
+  const rows = pickRowCount(safeTotal);
+  const perRow = Math.ceil(safeTotal / rows);
+  const row = Math.min(rows - 1, Math.floor(indexAmongCrowd / perRow));
+  const col = indexAmongCrowd % perRow;
+  const innerWidth = 100 - 2 * CROWD_X_INSET;
+  const colCenter =
+    perRow === 1 ? 50 : CROWD_X_INSET + (col + 0.5) * (innerWidth / perRow);
+  const yBase = CROWD_ROW_Y_PCTS[rows][row];
+  const seed = hashString(participant.user_id);
+  const xJitter = ((seed % 100) / 100 - 0.5) * 6;
+  const yJitter = (((seed >> 8) % 100) / 100 - 0.5) * 4;
+  const xPct = Math.max(6, Math.min(94, colCenter + xJitter));
+  const yPct = Math.max(50, Math.min(96, yBase + yJitter));
+  return { xPct, yPct };
 }
 
 function familiarSurfaceStyle(familiar: FamiliarConfig): CSSProperties {
@@ -238,55 +312,187 @@ export function ReactionBar({ onReact }: { onReact: (kind: ReactionKind) => void
   );
 }
 
+function useStageBeat(
+  anchor: BeatAnchor | null | undefined,
+  stageRef: RefObject<HTMLDivElement | null>,
+) {
+  const lastTrackIdRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    let raf = 0;
+    const loop = () => {
+      const now = Date.now();
+      const phase = computeBeatPhase(anchor ?? null, now);
+      const sinPhase = Math.sin(phase * 2 * Math.PI);
+      stage.style.setProperty('--bob-y', `${sinPhase * BOB_AMPLITUDE_CROWD_PX}px`);
+      stage.style.setProperty('--bob-y-host', `${sinPhase * BOB_AMPLITUDE_HOST_PX}px`);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [anchor, stageRef]);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const trackId = anchor?.trackId ?? null;
+    const previous = lastTrackIdRef.current;
+    lastTrackIdRef.current = trackId;
+    if (previous === undefined) return;
+    if (previous === trackId) return;
+    if (!trackId) return;
+    stage.classList.add('familiar-room-glowing');
+    const timer = window.setTimeout(() => {
+      stage.classList.remove('familiar-room-glowing');
+    }, TRACK_GLOW_DURATION_MS);
+    return () => {
+      window.clearTimeout(timer);
+      stage.classList.remove('familiar-room-glowing');
+    };
+  }, [anchor?.trackId, stageRef]);
+}
+
 export function FamiliarRoom({
   participants,
   reactions,
   myUserId,
+  beatAnchor,
 }: {
   participants: SessionParticipant[];
   reactions: SessionReaction[];
   myUserId?: string | null;
+  beatAnchor?: BeatAnchor | null;
 }) {
+  const stageRef = useRef<HTMLDivElement>(null);
+  useStageBeat(beatAnchor, stageRef);
+
   const latestReactionByUser = new Map<string, SessionReaction>();
   for (const reaction of reactions) latestReactionByUser.set(reaction.user_id, reaction);
 
+  const host = participants.find((p) => p.role === 'host') ?? null;
+  const crowd = participants
+    .filter((p) => p.role !== 'host')
+    .slice()
+    .sort((a, b) => (a.user_id < b.user_id ? -1 : a.user_id > b.user_id ? 1 : 0));
+
   return (
-    <div className="rounded-2xl border border-zinc-800 bg-[radial-gradient(circle_at_top,_rgba(39,39,42,0.92),_rgba(9,9,11,0.98))] p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <div>
-          <div className="text-sm font-medium text-zinc-100">Mini Room</div>
-          <div className="text-xs text-zinc-500">Familiars brighten briefly when someone reacts</div>
-        </div>
+    <div className="rounded-2xl border border-zinc-800 overflow-hidden">
+      <div className="flex items-center justify-between px-3 pt-2 pb-1">
+        <div className="text-[10px] uppercase tracking-[0.22em] text-zinc-500">The Room</div>
         <div className="text-xs text-zinc-500">{participants.length} present</div>
       </div>
+      <div ref={stageRef} className="relative w-full aspect-[3/2] bg-[radial-gradient(ellipse_at_top,_rgba(39,39,42,0.95),_rgba(17,17,20,0.98)_55%,_rgba(9,9,11,1))]">
+        <div
+          className="absolute left-0 right-0 h-px bg-zinc-700/40"
+          style={{ top: '44%' }}
+          aria-hidden
+        />
+        <div
+          className="absolute left-1/2 -translate-x-1/2 text-[9px] uppercase tracking-[0.28em] text-zinc-500"
+          style={{ top: '4%' }}
+          aria-hidden
+        >
+          DJ Booth
+        </div>
 
-      <div className="flex flex-wrap justify-center gap-3">
-        {participants.map((participant) => {
-          const reaction = latestReactionByUser.get(participant.user_id);
-          const isLive = participant.role === 'host' || participant.webrtc_connected;
-          const isSelf = participant.user_id === myUserId;
-          return (
-            <div
-              key={participant.user_id}
-              className={`relative w-24 rounded-xl border border-zinc-800 bg-black/20 px-2 py-3 text-center ${isSelf ? 'ring-1 ring-emerald-500/40' : ''}`}
-            >
-              {reaction && (
-                <div className="absolute -top-2 left-1/2 -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-950 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-zinc-200">
-                  {reactionCopy[reaction.kind]}
-                </div>
-              )}
-              <div className="mb-2 flex justify-center">
-                <FamiliarGlyph familiar={participant.familiar} />
-              </div>
-              <div className="truncate text-xs font-medium text-zinc-200">{participant.username}</div>
-              <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-zinc-500">{participant.role}</div>
-              <div className="mt-2 flex items-center justify-center gap-1">
-                <span className={`w-1.5 h-1.5 rounded-full ${isLive ? 'bg-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.7)]' : 'bg-zinc-500'}`} />
-                <span className="text-[10px] text-zinc-500">{isLive ? 'Live' : 'Idle'}</span>
-              </div>
-            </div>
-          );
-        })}
+        {host && (
+          <RoomAvatar
+            participant={host}
+            position={computeRoomPosition(host, 0, 0)}
+            isHost
+            isSelf={host.user_id === myUserId}
+            isLive
+            reaction={latestReactionByUser.get(host.user_id)}
+          />
+        )}
+
+        {crowd.map((participant, index) => (
+          <RoomAvatar
+            key={participant.user_id}
+            participant={participant}
+            position={computeRoomPosition(participant, index, crowd.length)}
+            isHost={false}
+            isSelf={participant.user_id === myUserId}
+            isLive={participant.webrtc_connected ?? false}
+            reaction={latestReactionByUser.get(participant.user_id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RoomAvatar({
+  participant,
+  position,
+  isHost,
+  isSelf,
+  isLive,
+  reaction,
+}: {
+  participant: SessionParticipant;
+  position: RoomPosition;
+  isHost: boolean;
+  isSelf: boolean;
+  isLive: boolean;
+  reaction?: SessionReaction;
+}) {
+  const bobVar = isHost ? 'var(--bob-y-host, 0px)' : 'var(--bob-y, 0px)';
+  const wrapperStyle: CSSProperties = {
+    left: `${position.xPct}%`,
+    top: `${position.yPct}%`,
+    transform: `translate(-50%, calc(-50% + ${bobVar}))`,
+  };
+  const reactionKey = reaction
+    ? `${reaction.user_id}-${reaction.kind}-${reaction.timestamp}`
+    : undefined;
+
+  return (
+    <div className="absolute pointer-events-none" style={wrapperStyle}>
+      {reaction && (
+        <div
+          key={reactionKey}
+          className="absolute left-1/2 -top-3 rounded-full px-1.5 py-px text-[9px] uppercase tracking-[0.18em] whitespace-nowrap border bg-zinc-950 text-zinc-200 border-zinc-700"
+          style={{ animation: 'familiar-reaction-rise 4s ease-out forwards' }}
+          aria-hidden
+        >
+          {reactionCopy[reaction.kind]}
+        </div>
+      )}
+      {isHost && (
+        <div
+          className="absolute left-1/2 -translate-x-1/2 rounded-[50%]"
+          style={{
+            top: 'calc(100% - 8px)',
+            width: '64px',
+            height: '14px',
+            background: `radial-gradient(ellipse at center, ${withAlpha(participant.familiar.color, '55')}, transparent 70%)`,
+            filter: 'blur(2px)',
+          }}
+          aria-hidden
+        />
+      )}
+      <div
+        className={`relative ${isSelf ? 'ring-2 ring-emerald-400/60 ring-offset-2 ring-offset-transparent rounded-full' : ''}`}
+      >
+        <FamiliarGlyph familiar={participant.familiar} size={isHost ? 'md' : 'sm'} />
+        {isHost && (
+          <Crown
+            className="absolute -top-3 left-1/2 -translate-x-1/2 w-3.5 h-3.5 text-yellow-400"
+            aria-hidden
+          />
+        )}
+        {!isLive && !isHost && (
+          <div className="absolute inset-0 rounded-full bg-black/30" aria-hidden />
+        )}
+      </div>
+      <div
+        className="absolute left-1/2 -translate-x-1/2 mt-1 text-[9px] font-medium truncate max-w-[64px] text-center text-zinc-300"
+        style={{ top: '100%' }}
+      >
+        {participant.username}
+        {isSelf && <span className="ml-1 text-zinc-500">(you)</span>}
       </div>
     </div>
   );
